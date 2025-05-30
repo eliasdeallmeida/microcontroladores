@@ -5,11 +5,15 @@
 const char* ssid = "SSID";
 const char* password = "PASSWORD";
 
+<<<<<<< HEAD
 #define BOTtoken "BOT_TOKEN"
+=======
+#define BOT_TOKEN "BOT_TOKEN"
+>>>>>>> d8008ff (Fix: informações de WiFi e bot do Telegram)
 #define CHAT_ID "CHAT_ID"
 
 WiFiClientSecure client;
-UniversalTelegramBot bot(BOTtoken, client);
+UniversalTelegramBot bot(BOT_TOKEN, client);
 
 int botRequestDelay = 1000;
 unsigned long lastTimeBotRan;
