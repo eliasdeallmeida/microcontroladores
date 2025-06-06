@@ -26,14 +26,13 @@
 
 HardwareSerial gpsSerial(2);
 
+time_t ultimaLeitura = 0;
 String cartao;
-
+long duration;
 float greenLevel = 10;
 float yellowLevel = 20;
 float redLevel = 30;
 
-long duration;
-float distanceCm;
 float distances[NUM_MEASUREMENTS];
 
 const char* ssid = "SSID";
@@ -41,12 +40,12 @@ const char* password = "PASSWORD";
 
 int botRequestDelay = 1000;
 unsigned long lastTimeBotRan;
-
 int logIndex;
 
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 
+// Funções auxiliares
 float measureDistance();
 void sortArray(float array[], int size);
 void handleNewMessages(int numMessages);
@@ -57,16 +56,17 @@ bool cartaoAutorizado(const String &codigo);
 void salvarCartao(const String &codigo);
 void removerCartao(const String &codigo);
 
+// Tarefas
+void leituraDistanciaTask(void *parameter);
+void leituraCartaoTask(void *parameter);
+
 void setup() {
   Serial.begin(9600);
-
   pinMode(WATER_TANK_GREEN, OUTPUT);
   pinMode(WATER_TANK_YELLOW, OUTPUT);
   pinMode(WATER_TANK_RED, OUTPUT);
-
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-
   pinMode(DOOR_LOCK, OUTPUT);
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
   Serial.println("Serial 2 started at 9600 baud rate");
@@ -92,93 +92,106 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-
   struct tm timeinfo;
   while (!getLocalTime(&timeinfo)) {
     Serial.println("Aguardando sincronização NTP...");
     delay(1000);
   }
 
+  time(&ultimaLeitura);
+  Serial.print("Hora inicial: ");
+  Serial.println(ultimaLeitura);
+
   File logFile = LittleFS.open("/log.txt", "w");
   if (logFile) {
     logFile.println("### LOG INICIALIZADO ###");
     logFile.close();
-  } else {
-    Serial.println("Falha ao criar log.txt");
   }
 
-  File indexFile = LittleFS.open("/log_index.txt", "w");
-  if (indexFile) {
-    logIndex = indexFile.readStringUntil('\n').toInt() + 1;
-    indexFile.close();
-  }
+  File indexFile = LittleFS.open("/log_index.txt", "r");
+  logIndex = indexFile ? indexFile.readStringUntil('\n').toInt() + 1 : 1;
+  indexFile.close();
 
-    if (!LittleFS.exists("/cartoes.txt")) {
+  if (!LittleFS.exists("/cartoes.txt")) {
     File cartoesFile = LittleFS.open("/cartoes.txt", "w");
     if (cartoesFile) {
       cartoesFile.println("# Cartões cadastrados");
       cartoesFile.close();
-      Serial.println("Arquivo cartoes.txt criado.");
-    } else {
-      Serial.println("Falha ao criar cartoes.txt");
     }
   }
+
+  xTaskCreatePinnedToCore(leituraDistanciaTask, "SensorDistancia", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(leituraCartaoTask, "CartaoRFID", 4096, NULL, 1, NULL, 1);
 }
 
 void loop() {
-  for (int i = 0; i < NUM_MEASUREMENTS; i++) {
-    distances[i] = measureDistance();
-    delay(5);
-  }
-
-  sortArray(distances, NUM_MEASUREMENTS);
-  float median = distances[NUM_MEASUREMENTS / 2];
-
-  String logMessage = "Medição: " + String(median) + " cm";
-  logToFile(logMessage);
-
-  Serial.print("Mediana da distância (cm): ");
-  Serial.println(median);
-
-  digitalWrite(WATER_TANK_GREEN, LOW);
-  digitalWrite(WATER_TANK_YELLOW, LOW);
-  digitalWrite(WATER_TANK_RED, LOW);
-
-  if (median < greenLevel) {
-    digitalWrite(WATER_TANK_GREEN, HIGH);
-  } else if (median < yellowLevel) {
-    digitalWrite(WATER_TANK_YELLOW, HIGH);
-  } else if (median < redLevel) {
-    digitalWrite(WATER_TANK_RED, HIGH);
-  }
-
-  while (gpsSerial.available() > 0) {
-    char gpsData = gpsSerial.read();
-    cartao += gpsData;
-  }
-  if (cartao.length() >= 14) {
-    String codigoLimpo = limparCartao(cartao);
-    if (cartaoAutorizado(codigoLimpo)) {
-      digitalWrite(DOOR_LOCK, LOW);
-      delay(2000);
-      digitalWrite(DOOR_LOCK, HIGH);
-      Serial.println("Acesso permitido para cartão: " + codigoLimpo);
-      logToFile("Acesso permitido para cartão: " + codigoLimpo);
-    } else {
-      Serial.println("Acesso negado para cartão: " + codigoLimpo);
-      logToFile("Acesso negado para cartão: " + codigoLimpo);
-    }
-  }
-  cartao = "";
-
   if (millis() > lastTimeBotRan + botRequestDelay) {
     int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-
     while (numNewMessages) {
       handleNewMessages(numNewMessages);
       numNewMessages = bot.getUpdates(bot.last_message_received + 1);
     }
     lastTimeBotRan = millis();
+  }
+}
+
+void leituraDistanciaTask(void *parameter) {
+  while (true) {
+    for (int i = 0; i < NUM_MEASUREMENTS; i++) {
+      distances[i] = measureDistance();
+      delay(5);
+    }
+
+    sortArray(distances, NUM_MEASUREMENTS);
+    float median = distances[NUM_MEASUREMENTS / 2];
+
+    logToFile("Medição: " + String(median) + " cm");
+    Serial.println("Mediana da distância (cm): " + String(median));
+
+    digitalWrite(WATER_TANK_GREEN, LOW);
+    digitalWrite(WATER_TANK_YELLOW, LOW);
+    digitalWrite(WATER_TANK_RED, LOW);
+
+    if (median < greenLevel) digitalWrite(WATER_TANK_GREEN, HIGH);
+    else if (median < yellowLevel) digitalWrite(WATER_TANK_YELLOW, HIGH);
+    else if (median < redLevel) digitalWrite(WATER_TANK_RED, HIGH);
+
+    delay(1000);  // Aguarda 1 segundo antes da próxima medição
+  }
+}
+
+void leituraCartaoTask(void *parameter) {
+  while (true) {
+    while (gpsSerial.available() > 0) {
+      char gpsData = gpsSerial.read();
+      cartao += gpsData;
+    }
+
+    // Serial.println(cartao);
+
+    if (cartao.length() >= 14) {
+      String codigoLimpo = limparCartao(cartao);
+      if (cartaoAutorizado(codigoLimpo)) {
+        time_t agora;
+        time(&agora);  // Lê o horário atual
+
+        if (difftime(agora, ultimaLeitura) >= 5) {
+          // Serial.println("Já se passaram 5 segundos!");
+          ultimaLeitura = agora;  // Atualiza a última leitura
+          digitalWrite(DOOR_LOCK, LOW);
+          delay(2000);
+          digitalWrite(DOOR_LOCK, HIGH);
+          Serial.println("Acesso permitido para cartão: " + codigoLimpo);
+          logToFile("Acesso permitido para cartão: " + codigoLimpo);
+        }
+      } else {
+        Serial.println("Acesso negado para cartão: " + codigoLimpo);
+        logToFile("Acesso negado para cartão: " + codigoLimpo);
+      }
+      cartao = "";
+    }
+
+    delay(200);  // Evita sobrecarga de CPU
   }
 }
 
@@ -258,7 +271,7 @@ void handleNewMessages(int numNewMessages) {
         bot.sendMessage(chat_id, "Valor inválido. Use: /definir_nivel_vermelho <valor_em_cm>", "");
       }
     }
-    else if (text == "/log_caixa_dagua") {
+    else if (text == "/log") {
       File file = LittleFS.open("/log.txt", "r");
       if (!file) {
         bot.sendMessage(chat_id, "Erro ao abrir log.txt", "");
